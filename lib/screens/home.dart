@@ -63,7 +63,9 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
                       color: Colors.grey.withOpacity(0.2), width: 10)),
               child: Center(
                   child: AutoSizeText(
-                controller.user!.ratio.toString() + '%',
+                // controller.user!.ratio.toString()
+                //  +
+                  '85 %',
                 style: TextStyle(
                     color: Colors.green,
                     fontSize: 50,
