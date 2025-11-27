@@ -134,61 +134,105 @@ class AuthRepository extends GetxController with WidgetsBindingObserver {
     }
   }
 
-  Future<dynamic> login(String email, String password) async {
-    _status(Status.Loading);
-    try {
-      _email(email);
-      _password(password);
-      initOneSignal();
-      var response = await http.post(
-        Uri.parse(ApiLink.login),
-        body: {
-          "username": email,
-          // "email": email,
-          "password": password,
-          "client_id":'7',
-          "grant_type":"password",
-          "client_secret":"9jfIyHZJzV9usVZXtvzd8702IGvwh4fcllyCWXx1",
-          "device_id":"0000",
-          "onesignal_player_id":"111s"
-        },
-      );
-      var json = jsonDecode(response.body);
-      print("login response $json");
-      if (json['errors'] != null) {
-        throw (json['errors'][0]['message']);
-      }
+Future<dynamic> login(String email, String password) async {
+  _status(Status.Loading);
+  try {
+    _email(email);
+    _password(password);
+    initOneSignal();
 
-      print("result is $json");
+    final sp = await SharedPreferences.getInstance();
+    // ✅ Clear only login-related keys, NOT all SharedPreferences (preserve installation_id)
+    await sp.remove('access_token');
+    await sp.remove('user_id');
+    await sp.remove('flutter.access_token');
+    await sp.remove('flutter.user_id');
+    await sp.remove('flutter.App Is Login');
+    await sp.remove('App Is Login');
 
-      var userModel = User.fromJson(json);
-      if (userModel != null) {
-        user = userModel;
-        token(json["access_token"]);
-        _save(token.value);
+    var response = await http.post(
+      Uri.parse(ApiLink.login),
+      body: {
+        "username": email,
+        "password": password,
+        "client_id": '7',
+        "grant_type": "password",
+        "client_secret": "9jfIyHZJzV9usVZXtvzd8702IGvwh4fcllyCWXx1",
+        "device_id": "0000",
+        "onesignal_player_id": "111s"
+      },
+    );
 
-        print("User Value ${userModel.toUserJson()}");
+    var json = jsonDecode(response.body);
+    print("🔹 login response $json");
 
-        liveUser(userModel);
-        userId(userModel.user);
-
-        _status(Status.Authenticated);
-        pref!.setUser(userModel);
-
-        final sp = await SharedPreferences.getInstance();
-  sp.setString("user_id", json["user_id"].toString());
-
-        startService();
-
-        Get.offAll(() => const HomeNavigation());
-      }
-      return response.body;
-    } catch (ex) {
-      _status(Status.Unknown_Error);
-      _errorMessage(ex.toString());
-      print(ex.toString());
+    // ✅ Step 1: Handle server or HTTP-level errors
+    if (response.statusCode != 200) {
+      _status(Status.Error);
+      _errorMessage("Server error: ${response.statusCode}");
+      print("❌ Server responded with error code ${response.statusCode}");
+      return;
     }
+
+    // ✅ Step 2: Detect invalid credentials or failed login
+    if (json['message'] != null &&
+        json['message'].toString().toLowerCase().contains('invalid')) {
+      _status(Status.Error);
+      _errorMessage(json['message']);
+      // Clear only login-related keys, NOT all SharedPreferences (preserve installation_id)
+      await sp.remove('access_token');
+      await sp.remove('user_id');
+      await sp.remove('flutter.access_token');
+      await sp.remove('flutter.user_id');
+      await sp.remove('flutter.App Is Login');
+      await sp.remove('App Is Login');
+      print("❌ Invalid credentials detected — stopping login flow");
+      return; // ❗ stop here, no navigation
+    }
+
+    // ✅ Step 3: Ensure a valid token and user data exists
+    if (json["access_token"] == null ||
+        json["user_id"] == null ||
+        json["access_token"].toString().isEmpty) {
+      _status(Status.Error);
+      _errorMessage('Login failed: token or user data missing.');
+      // Clear only login-related keys, NOT all SharedPreferences (preserve installation_id)
+      await sp.remove('access_token');
+      await sp.remove('user_id');
+      await sp.remove('flutter.access_token');
+      await sp.remove('flutter.user_id');
+      await sp.remove('flutter.App Is Login');
+      await sp.remove('App Is Login');
+      print("❌ Missing token or user_id — stopping login flow");
+      return; // ❗ stop here
+    }
+
+    // ✅ Step 4: Proceed with success
+    print("✅ Login success, saving user and navigating...");
+    var userModel = User.fromJson(json);
+    user = userModel;
+    token(json["access_token"]);
+    _save(token.value);
+
+    liveUser(userModel);
+    userId(userModel.user);
+
+    _status(Status.Authenticated);
+    pref!.setUser(userModel);
+
+    sp.setString("access_token", json["access_token"]);
+    sp.setString("user_id", json["user_id"].toString());
+
+    startService();
+
+    // ✅ Navigate only after confirmed successful login
+    Get.offAll(() => const HomeNavigation());
+  } catch (ex) {
+    print("❌ Login exception: $ex");
+    _status(Status.Error);
+    _errorMessage(ex.toString());
   }
+}
 
   Future<dynamic> getUserData(String email, String password) async {
     _status(Status.Loading);

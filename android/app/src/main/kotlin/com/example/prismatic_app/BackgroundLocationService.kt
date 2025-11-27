@@ -4,460 +4,489 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.provider.Settings
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
-import android.os.Build
-import android.os.Bundle
-import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
-import android.provider.Settings
+import android.net.ConnectivityManager
+import android.os.*
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.net.HttpURLConnection
 import java.net.URL
 
 class BackgroundLocationService : Service(), LocationListener {
+
     companion object {
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "location_service_channel"
         private const val CHANNEL_NAME = "Location Service"
-        private const val LOCATION_UPDATE_INTERVAL = 5000L // 1 second
-        private const val LOCATION_UPDATE_DISTANCE = 0f // 1 meter
+        private const val LOCATION_UPDATE_INTERVAL = 1000L // 1 sec - more frequent updates to track device movement
+        private const val LOCATION_UPDATE_DISTANCE = 0f // Update on ANY movement (even 0 meters) to track exact current location
     }
 
     private lateinit var locationManager: LocationManager
     private var handler: Handler? = null
     private var lastKnownLocation: Location? = null
     private var deviceId: String = ""
+    private lateinit var dbHelper: LocationDatabaseHelper
+    private var connectivityReceiver: BroadcastReceiver? = null
 
     override fun onCreate() {
         super.onCreate()
-        android.util.Log.d("LocationService", "onCreate called - Service starting up")
-        
-        try {
-            // Get device ID
-            deviceId = getDeviceId()
-            android.util.Log.d("LocationService", "Device ID: $deviceId")
-            
-            createNotificationChannel()
-            val notification = createNotification()
-            startForeground(NOTIFICATION_ID, notification)
-            android.util.Log.d("LocationService", "Foreground service started with notification")
-            
-            initializeLocationManager()
-            startContinuousLocationSending()
-            android.util.Log.d("LocationService", "Location tracking initialized - Ready to send location data")
-        } catch (e: Exception) {
-            android.util.Log.e("LocationService", "Error in onCreate: ${e.message}")
-            e.printStackTrace()
-        }
+        android.util.Log.d("LocationService", "onCreate called")
+
+        deviceId = getDeviceId()
+        dbHelper = LocationDatabaseHelper(this)
+
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, createNotification())
+        initializeLocationManager()
+        startContinuousLocationSending()
+        registerNetworkReceiver()
+
+        android.util.Log.d("LocationService", "Service initialized successfully")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        android.util.Log.d("LocationService", "Service started with START_STICKY")
-        
-        // Ensure location tracking is initialized
-        if (!::locationManager.isInitialized) {
-            initializeLocationManager()
-        }
-        
-        // Ensure continuous location sending is started
-        if (handler == null) {
-            startContinuousLocationSending()
-        }
-        
-        // Return START_STICKY to restart service if killed by system
+        if (!::locationManager.isInitialized) initializeLocationManager()
+        if (handler == null) startContinuousLocationSending()
         return START_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                CHANNEL_ID,
-                CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Location tracking service"
-                setShowBadge(false)
-            }
+                CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW
+            ).apply { description = "Location tracking service" }
 
-            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.createNotificationChannel(channel)
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(channel)
         }
     }
 
     private fun createNotification(): Notification {
-        try {
-            val intent = Intent(this, MainActivity::class.java)
-            val pendingIntent = PendingIntent.getActivity(
-                this, 0, intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-
-            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("App is Running")
-                .setContentText("Sending location every second - ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}")
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-                .setContentIntent(pendingIntent)
-                .setOngoing(true)
-                .setPriority(NotificationCompat.PRIORITY_MAX)
-                .setAutoCancel(false)
-                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-                .build()
-            
-            android.util.Log.d("LocationService", "Notification created successfully")
-            return notification
-        } catch (e: Exception) {
-            android.util.Log.e("LocationService", "Error creating notification: ${e.message}")
-            e.printStackTrace()
-            
-            // Fallback notification
-            return NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("Location Service")
-                .setContentText("Running")
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-                .setOngoing(true)
-                .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .build()
-        }
+        val intent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("App is Running")
+            .setContentText("Tracking location every 2 min")
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .build()
     }
 
     private fun initializeLocationManager() {
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        
         try {
-            // Check if permissions are granted for both fine and background location
-            val fineLocationGranted = androidx.core.content.ContextCompat.checkSelfPermission(
-                this, android.Manifest.permission.ACCESS_FINE_LOCATION
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            
-            val backgroundLocationGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                androidx.core.content.ContextCompat.checkSelfPermission(
-                    this, android.Manifest.permission.ACCESS_BACKGROUND_LOCATION
-                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            } else {
-                true // Background location permission not required for older Android versions
-            }
-            
-            android.util.Log.d("LocationService", "Fine location permission: $fineLocationGranted")
-            android.util.Log.d("LocationService", "Background location permission: $backgroundLocationGranted")
-            
-            if (fineLocationGranted) {
-                // Request location updates with enhanced settings for real devices
-                if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                    try {
-                        locationManager.requestLocationUpdates(
-                            LocationManager.GPS_PROVIDER,
-                            LOCATION_UPDATE_INTERVAL,
-                            LOCATION_UPDATE_DISTANCE,
-                            this
-                        )
-                        locationManager.requestLocationUpdates(
-                            LocationManager.NETWORK_PROVIDER,
-                            LOCATION_UPDATE_INTERVAL,
-                            LOCATION_UPDATE_DISTANCE,
-                            this
-)
-                        android.util.Log.d("LocationService", "GPS location tracking started")
-                    } catch (e: Exception) {
-                        android.util.Log.e("LocationService", "Error starting GPS tracking: ${e.message}")
-                    }
-                }
-                
-                if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                    try {
-                        locationManager.requestLocationUpdates(
-                            LocationManager.NETWORK_PROVIDER,
-                            LOCATION_UPDATE_INTERVAL,
-                            LOCATION_UPDATE_DISTANCE,
-                            this
-                        )
-                        android.util.Log.d("LocationService", "Network location tracking started")
-                    } catch (e: Exception) {
-                        android.util.Log.e("LocationService", "Error starting Network tracking: ${e.message}")
-                    }
-                }
-                
-                // Get last known location immediately with retry mechanism
+            if (ContextCompat.checkSelfPermission(
+                    this, android.Manifest.permission.ACCESS_FINE_LOCATION
+                ) == PackageManager.PERMISSION_GRANTED
+            ) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    LOCATION_UPDATE_INTERVAL,
+                    LOCATION_UPDATE_DISTANCE,
+                    this
+                )
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER,
+                    LOCATION_UPDATE_INTERVAL,
+                    LOCATION_UPDATE_DISTANCE,
+                    this
+                )
                 getLastKnownLocationWithRetry()
-                
-                android.util.Log.d("LocationService", "Location tracking started successfully")
-            } else {
-                android.util.Log.e("LocationService", "Fine location permission not granted")
             }
-            
-            if (!backgroundLocationGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                android.util.Log.w("LocationService", "Background location permission not granted - may affect kill state tracking")
-            }
-            
-        } catch (e: SecurityException) {
-            android.util.Log.e("LocationService", "Permission not granted: ${e.message}")
         } catch (e: Exception) {
-            android.util.Log.e("LocationService", "Error initializing location manager: ${e.message}")
+            android.util.Log.e("LocationService", "Error initializing location: ${e.message}")
         }
     }
-    
+
     private fun getLastKnownLocationWithRetry() {
-        var retryCount = 0
-        val maxRetries = 3
-        
-        while (retryCount < maxRetries) {
+        // Don't send old cached location on startup - wait for fresh location from 2-minute loop
+        // This ensures we always send current live location, not old cached location
+        val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+        for (p in providers) {
             try {
-                val lastKnownLocation = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                if (lastKnownLocation != null && lastKnownLocation.latitude != 0.0 && lastKnownLocation.longitude != 0.0) {
-                    this.lastKnownLocation = lastKnownLocation
-                    android.util.Log.d("LocationService", "Last known location: ${lastKnownLocation.latitude}, ${lastKnownLocation.longitude}")
-                    sendLocationToServer(lastKnownLocation)
+                val loc = locationManager.getLastKnownLocation(p)
+                if (loc != null) {
+                    lastKnownLocation = loc
+                    // Don't send immediately - let the 2-minute loop send current location
+                    android.util.Log.d("LocationService", "Initial location obtained, will send current location in 2-minute loop")
                     break
-                } else {
-                    // Try network provider as fallback
-                    val networkLocation = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                    if (networkLocation != null && networkLocation.latitude != 0.0 && networkLocation.longitude != 0.0) {
-                        this.lastKnownLocation = networkLocation
-                        android.util.Log.d("LocationService", "Network last known location: ${networkLocation.latitude}, ${networkLocation.longitude}")
-                        sendLocationToServer(networkLocation)
-                        break
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("LocationService", "Error getting last location: ${e.message}")
+            }
+        }
+    }
+
+    override fun onLocationChanged(location: Location) {
+        lastKnownLocation = location
+    }
+
+    /**
+     * Try to obtain a fresh location fix from GPS/Network within the given timeout.
+     * Falls back to null if no update arrives in time. Caller decides how to proceed.
+     */
+    private fun getFreshLocationBlocking(timeoutMs: Long = 5000L): Location? {
+        return try {
+            if (ContextCompat.checkSelfPermission(
+                    this, android.Manifest.permission.ACCESS_FINE_LOCATION
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                return null
+            }
+
+            var freshLocation: Location? = null
+            val lock = Object()
+            val tempListener = object : LocationListener {
+                override fun onLocationChanged(location: Location) {
+                    synchronized(lock) {
+                        if (freshLocation == null) {
+                            freshLocation = location
+                            lock.notifyAll()
+                        }
                     }
                 }
-                retryCount++
-                if (retryCount < maxRetries) {
-                    android.util.Log.d("LocationService", "Retrying to get last known location...")
-                    Thread.sleep(1000) // Wait 1 second before retry
-                }
-            } catch (e: SecurityException) {
-                android.util.Log.e("LocationService", "Error getting last known location (attempt ${retryCount + 1}): ${e.message}")
-                retryCount++
-            } catch (e: Exception) {
-                android.util.Log.e("LocationService", "Error getting last known location (attempt ${retryCount + 1}): ${e.message}")
-                retryCount++
             }
+
+            // Request updates from both providers to get whichever comes first
+            try {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    0L,
+                    0f,
+                    tempListener,
+                    Looper.getMainLooper()
+                )
+            } catch (_: Exception) { }
+            try {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER,
+                    0L,
+                    0f,
+                    tempListener,
+                    Looper.getMainLooper()
+                )
+            } catch (_: Exception) { }
+
+            // Wait for the first incoming update or timeout
+            synchronized(lock) {
+                if (freshLocation == null) {
+                    try {
+                        lock.wait(timeoutMs)
+                    } catch (_: InterruptedException) { }
+                }
+            }
+
+            // Stop temporary updates
+            try { locationManager.removeUpdates(tempListener) } catch (_: Exception) { }
+
+            // If we got a fresh fix, also update lastKnownLocation for future fallback
+            if (freshLocation != null) {
+                lastKnownLocation = freshLocation
+            }
+            freshLocation
+        } catch (_: Exception) {
+            null
         }
-        
-        if (retryCount >= maxRetries) {
-            android.util.Log.w("LocationService", "Could not get last known location after $maxRetries attempts")
-        }
     }
 
-    // LocationListener methods
-     override fun onLocationChanged(location: Location) {
-        android.util.Log.d("LocationService", "Location changed via Listener: ${location.latitude}, ${location.longitude}")
-        lastKnownLocation = location // Update lastKnownLocation from the *real* listener callback
-        sendLocationToServer(location)
-    }
-
-    override fun onProviderEnabled(provider: String) {
-        android.util.Log.d("LocationService", "Provider enabled: $provider")
-    }
-
-    override fun onProviderDisabled(provider: String) {
-        android.util.Log.d("LocationService", "Provider disabled: $provider")
-    }
-
-    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {
-        android.util.Log.d("LocationService", "Status changed: $provider, $status")
-    }
-
-private fun startContinuousLocationSending() {
+    private fun startContinuousLocationSending() {
         handler = Handler(Looper.getMainLooper())
         handler?.postDelayed(object : Runnable {
             override fun run() {
-                // The primary goal is to get the freshest location before sending.
-                // The LocationListener updates lastKnownLocation when a new fix is available,
-                // but for 1-second interval, we will check getLastKnownLocation for the most current fix.
-                
-                var locationToSend: Location? = null
-                
                 try {
-                    // 1. Try GPS provider first for best accuracy
-                    var freshLocation = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                    // ALWAYS get EXACT CURRENT location every 2 minutes - ensure it's the LIVE location where device is NOW
+                    var locationToSend: Location? = null
+                    var freshestLocation: Location? = null
+                    var freshestTime: Long = 0
                     
-                    if (freshLocation == null || freshLocation.latitude == 0.0 && freshLocation.longitude == 0.0) {
-                        // 2. Fallback to Network provider
-                        freshLocation = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                    // FIRST: Try to get actively requested FRESH location (this ensures we get current location)
+                    locationToSend = getFreshLocationBlocking(5000L) // 5 seconds to get fresh location
+                    if (locationToSend != null) {
+                        freshestLocation = locationToSend
+                        freshestTime = locationToSend.time
+                        lastKnownLocation = locationToSend
+                        android.util.Log.d("LocationService", "Got FRESH location from active request: lat=${locationToSend.latitude}, lng=${locationToSend.longitude}")
                     }
                     
-                    if (freshLocation != null && (lastKnownLocation == null || freshLocation.time > lastKnownLocation!!.time - 5000)) {
-                        // Use the fresh location if it's new enough (within last 5 seconds)
-                        // or if we didn't have a last known location.
-                        locationToSend = freshLocation
-                        lastKnownLocation = freshLocation // Update the stored last known location
-                        android.util.Log.d("LocationService", "Continuous sender: Updated lastKnownLocation from getLastKnownLocation.")
-                    } else if (lastKnownLocation != null) {
-                        // If getLastKnownLocation is null or too old, use the last one received from onLocationChanged
-                        locationToSend = lastKnownLocation
-                        android.util.Log.d("LocationService", "Continuous sender: Using lastKnownLocation from Listener.")
+                    // SECOND: Check lastKnownLocation - only use if it's very recent (less than 5 seconds old)
+                    // This ensures we use CURRENT location, not stale one
+                    if (lastKnownLocation != null) {
+                        val age = System.currentTimeMillis() - lastKnownLocation!!.time
+                        if (age < 5000 && lastKnownLocation!!.time > freshestTime) { // Less than 5 seconds old and newer than what we have
+                            freshestLocation = lastKnownLocation
+                            freshestTime = lastKnownLocation!!.time
+                            android.util.Log.d("LocationService", "Using RECENT lastKnownLocation (age: ${age}ms): lat=${freshestLocation?.latitude}, lng=${freshestLocation?.longitude}")
+                        } else if (age >= 5000) {
+                            android.util.Log.w("LocationService", "lastKnownLocation is too old (age: ${age}ms) - not using it")
+                        }
                     }
                     
-                } catch (e: SecurityException) {
-                    android.util.Log.e("LocationService", "Error getting last known location in continuous sender: ${e.message}")
+                    // Use the freshest location found
+                    locationToSend = freshestLocation
+                    
+                    // THIRD PRIORITY: Fallback to providers (to ensure we always send)
+                    if (locationToSend == null) {
+                        try {
+                            val gpsLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                            val networkLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                            
+                            // Use the one with the most recent timestamp
+                            if (gpsLoc != null && networkLoc != null) {
+                                locationToSend = if (gpsLoc.time > networkLoc.time) gpsLoc else networkLoc
+                            } else if (gpsLoc != null) {
+                                locationToSend = gpsLoc
+                            } else if (networkLoc != null) {
+                                locationToSend = networkLoc
+                            }
+                            
+                            if (locationToSend != null) {
+                                lastKnownLocation = locationToSend
+                                android.util.Log.d("LocationService", "Using provider location as fallback: lat=${locationToSend.latitude}, lng=${locationToSend.longitude}")
+                            }
+                        } catch (e: Exception) {
+                            android.util.Log.e("LocationService", "Error getting location from providers: ${e.message}")
+                        }
+                    }
+                    
+                    // ALWAYS send EXACT CURRENT location every 2 minutes (only when online)
+                    if (locationToSend != null) {
+                        if (isInternetAvailable()) {
+                            // Internet available - ALWAYS send EXACT CURRENT location to API every 2 minutes
+                            sendLocationToServer(locationToSend)
+                            updateNotificationWithLocation(locationToSend)
+                            android.util.Log.d("LocationService", "✅ Online - Sent EXACT CURRENT location to API: lat=${locationToSend.latitude}, lng=${locationToSend.longitude}")
+                        } else {
+                            // No internet - DO NOT store offline lat/lng to local database
+                            // val jsonData = buildLocationJson(locationToSend)
+                            // dbHelper.insertLocation(jsonData)
+                            android.util.Log.d("LocationService", "⚠️ Offline - NOT storing location (offline storage disabled)")
+                        }
+                    } else {
+                        android.util.Log.w("LocationService", "No location available - will retry in 2 minutes")
+                    }
                 } catch (e: Exception) {
-                    android.util.Log.e("LocationService", "Error getting location in continuous sender: ${e.message}")
+                    android.util.Log.e("LocationService", "Error in loop: ${e.message}")
                 }
 
-
-                if (locationToSend != null) {
-                    android.util.Log.d("LocationService", "Sending continuous location (1s loop): ${locationToSend.latitude}, ${locationToSend.longitude}")
-                    sendLocationToServer(locationToSend)
-                    
-                    // Update notification with current location
-                    updateNotificationWithLocation(locationToSend)
-                } else {
-                    android.util.Log.d("LocationService", "No valid location available for continuous sending in 1s loop - waiting for GPS lock")
-                }
-                
-                // Schedule next execution every 1 second
-                handler?.postDelayed(this, 1000) // 1 second
+                // Repeat every 2 minutes - ALWAYS call API every 2 minutes
+                handler?.postDelayed(this, 120000)
             }
-        }, 1000) // Start after 1 second
+        }, 2000)
     }
 
     private fun updateNotificationWithLocation(location: Location) {
-        try {
-            val intent = Intent(this, MainActivity::class.java)
-            val pendingIntent = PendingIntent.getActivity(
-                this, 0, intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val intent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("App is Running")
+            .setContentText(
+                "Lat: %.6f, Lng: %.6f".format(location.latitude, location.longitude)
             )
-
-            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("App is Running")
-                .setContentText("Lat: ${String.format("%.6f", location.latitude)}, Lng: ${String.format("%.6f", location.longitude)} - ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}")
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-                .setContentIntent(pendingIntent)
-                .setOngoing(true)
-                .setPriority(NotificationCompat.PRIORITY_MAX)
-                .setAutoCancel(false)
-                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-                .build()
-
-            startForeground(NOTIFICATION_ID, notification)
-        } catch (e: Exception) {
-            android.util.Log.e("LocationService", "Error updating notification: ${e.message}")
-        }
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .build()
+        startForeground(NOTIFICATION_ID, notification)
     }
 
-private fun sendLocationToServer(location: Location) {
-
-     val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-    val userJson = prefs.getString("flutter.App Is Login", null)
+    private fun buildLocationJson(location: Location): String {
+    val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
     val token = prefs.getString("flutter.access_token", null)
-   var userId = prefs.getString("flutter.user_id", "0") ?: "0"  // make it var
-    if (userJson != null && userJson.isNotEmpty()) {
+    var userId = prefs.getString("flutter.user_id", "0") ?: "0"
+    val userJson = prefs.getString("flutter.App Is Login", null)
+
+    if (!userJson.isNullOrEmpty()) {
         try {
-            val jsonObj = org.json.JSONObject(userJson)
-               userId = jsonObj.optString("id", userId)    // depends on your User model JSON
-        } catch (e: Exception) {
-            android.util.Log.e("LocationService", "Error parsing user JSON: ${e.message}")
-        }
+            val obj = org.json.JSONObject(userJson)
+            userId = obj.optString("id", userId)
+        } catch (_: Exception) {}
     }
 
-    val currentTime = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.getDefault()).format(java.util.Date())
+    val currentTime = java.text.SimpleDateFormat(
+        "yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.getDefault()
+    ).format(java.util.Date())
 
-    // This method will send location data to your server
-    android.util.Log.d("LocationService", "Lat: ${location.latitude}, Lng: ${location.longitude}")
-    
-    // Send location data to your existing API endpoint
+    val batteryStatus = registerReceiver(
+        null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED)
+    )
+    val level = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
+    val scale = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1) ?: -1
+    val batteryPct = if (level >= 0 && scale > 0) (level * 100 / scale.toFloat()).toInt() else -1
+    val status = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
+    val isCharging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == android.os.BatteryManager.BATTERY_STATUS_FULL
+
+        return """
+        {
+            "lat": ${location.latitude},
+            "long": ${location.longitude},
+            "user_id": "$userId",
+            "token": "$token",
+            "player_id": "$deviceId",
+            "status": "app",
+            "app_state": "kill_state",
+            "check_in": false,
+            "check_out": false,
+            "time": "$currentTime",
+            "timestamp": "$currentTime",
+            "battery_level": $batteryPct,
+            "is_charging": $isCharging
+        }
+    """.trimIndent()
+    }
+
+    private fun sendLocationToServer(location: Location) {
+        val jsonData = buildLocationJson(location)
+
     Thread {
         try {
-            val url = URL("https://softwareworkmanservices.com.pk/api/check-out")
-            val connection = url.openConnection() as HttpURLConnection
-            
-            connection.requestMethod = "POST"
-            connection.setRequestProperty("Content-Type", "application/json")
-            connection.doOutput = true
-            
-            // ✅ Get battery info
-            val batteryStatus = registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
-            val level = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
-            val scale = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1) ?: -1
-            val batteryPct = if (level >= 0 && scale > 0) (level * 100 / scale.toFloat()).toInt() else -1
-            val status = batteryStatus?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
-            val isCharging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING || status == android.os.BatteryManager.BATTERY_STATUS_FULL
-
-            // Get current time in the same format as Flutter
-            val currentTime = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.getDefault()).format(java.util.Date())
-            
-            val jsonData = """
-                {
-                    "lat": ${location.latitude},
-                    "long": ${location.longitude},
-                    "user_id": "$userId",
-                    "token": "$token",
-                    "player_id": "$deviceId",
-                    "status": "app",
-                    "app_state": "kill_state",
-                    "check_in": false,
-                    "check_out": false,
-                    "time": "$currentTime",
-                    "timestamp": "$currentTime",
-                    "battery_level": $batteryPct,
-                    "is_charging": $isCharging
-                }
-            """.trimIndent()
-            
-            android.util.Log.d("LocationService", "Sending JSON: $jsonData")
-            
-            val outputStream = connection.outputStream
-            outputStream.write(jsonData.toByteArray())
-            outputStream.flush()
-            outputStream.close()
-            
-            val responseCode = connection.responseCode
-            android.util.Log.d("LocationService", "API Response Code: $responseCode")
-            
-            // Read response body for debugging
-            if (responseCode != 200) {
-                val errorStream = connection.errorStream
-                if (errorStream != null) {
-                    val errorResponse = errorStream.bufferedReader().use { it.readText() }
-                    android.util.Log.e("LocationService", "Error Response: $errorResponse")
-                }
+            if (isInternetAvailable()) {
+                    // Send current location only (stored locations are handled by the 2-minute loop)
+                sendJsonToServer(jsonData)
+                android.util.Log.d("LocationService", "Current location sent: $jsonData")
             } else {
-                val responseStream = connection.inputStream
-                val responseBody = responseStream.bufferedReader().use { it.readText() }
-                android.util.Log.d("LocationService", "Success Response: $responseBody")
+                // 🔹 No internet → Save current location locally
+                android.util.Log.w("LocationService", "No internet - saving current location")
+                dbHelper.insertLocation(jsonData)
             }
-            
-            connection.disconnect()
         } catch (e: Exception) {
             android.util.Log.e("LocationService", "Error sending location: ${e.message}")
-            e.printStackTrace()
+            // 🔹 If send failed for any reason, save locally
+            dbHelper.insertLocation(jsonData)
         }
     }.start()
 }
 
 
-    override fun onDestroy() {
-        super.onDestroy()
-        
-        // Stop continuous location sending
-        handler?.removeCallbacksAndMessages(null)
-        
-        try {
-            locationManager.removeUpdates(this)
-        } catch (e: SecurityException) {
-            android.util.Log.e("LocationService", "Error removing location updates: ${e.message}")
-        }
-        
-        android.util.Log.d("LocationService", "Service destroyed")
+    private fun sendJsonToServer(jsonData: String) {
+        val url = URL("https://softwareworkmanservices.com.pk/api/check-out")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.doOutput = true
+        conn.outputStream.use { it.write(jsonData.toByteArray()) }
+        val responseCode = conn.responseCode
+        android.util.Log.d("LocationService", "Response Code: $responseCode")
+        conn.disconnect()
     }
-    
+
+    private fun isInternetAvailable(): Boolean {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val active = cm.activeNetworkInfo
+            active != null && active.isConnected
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // ✅ Detect when internet becomes available again
+    // When internet restores, send CURRENT location to API (NOT stored offline data)
+private fun registerNetworkReceiver() {
+    connectivityReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (isInternetAvailable()) {
+                    android.util.Log.d("LocationService", "Internet restored - sending CURRENT lat/lng to API")
+                Thread {
+                    try {
+                        // DO NOT send stored offline data - only send current location
+                        // val unsentList = dbHelper.getUnsentLocations()
+                        // if (unsentList.isNotEmpty()) {
+                        //     android.util.Log.d(
+                        //         "LocationService",
+                        //             "Sending ${unsentList.size} stored locations to API in order"
+                        //     )
+                        //         
+                        //         // Send all stored locations in order (oldest first) - ensure no duplicates
+                        //         unsentList.forEach { (id, json) ->
+                        //             try {
+                        //                 android.util.Log.d("LocationService", "Sending stored location ID $id to API (in order)")
+                        //                 sendJsonToServer(json)
+                        //                 // Mark as sent immediately after successful send to prevent duplicate sends
+                        //                 dbHelper.markAsSent(id)
+                        //             } catch (e: Exception) {
+                        //                 android.util.Log.e(
+                        //                     "LocationService",
+                        //                     "Failed to send stored location ID $id: ${e.message}"
+                        //                 )
+                        //             }
+                        //         }
+                        //         
+                        //         // After all stored locations are sent successfully, clear them from database
+                        //         // This ensures data sent from local database is NOT sent again
+                        //         dbHelper.clearSent()
+                        //         android.util.Log.d("LocationService", "All stored locations sent in order - database cleared (no duplicates will be sent)")
+                        //     } else {
+                        //         android.util.Log.d("LocationService", "No stored locations - database is empty")
+                        //     }
+                            
+                            // Send CURRENT location (from active listeners, not cached)
+                            var currentLocation = getFreshLocationBlocking(3000L) // Try fresh location first
+                            
+                            // If no fresh location, use lastKnownLocation (updated every 1 second by onLocationChanged - this is CURRENT location)
+                            if (currentLocation == null && lastKnownLocation != null) {
+                                currentLocation = lastKnownLocation
+                            }
+                            
+                            if (currentLocation != null) {
+                                lastKnownLocation = currentLocation // Update for reference
+                                android.util.Log.d("LocationService", "Internet restored - sending CURRENT lat/lng to API: lat=${currentLocation.latitude}, lng=${currentLocation.longitude}")
+                                sendLocationToServer(currentLocation)
+                                updateNotificationWithLocation(currentLocation)
+                            } else {
+                                android.util.Log.w("LocationService", "Internet restored but no current location available")
+                            }
+                            
+                            // After sending current location, the 2-minute loop will continue normally
+                            android.util.Log.d("LocationService", "Internet restored - will continue sending current lat/lng every 2 minutes")
+                    } catch (e: Exception) {
+                        android.util.Log.e("LocationService", "Error in network receiver: ${e.message}")
+                    }
+                }.start()
+            }
+        }
+    }
+    registerReceiver(connectivityReceiver, IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION))
+}
+
+
     private fun getDeviceId(): String {
         return try {
             Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
         } catch (e: Exception) {
-            android.util.Log.e("LocationService", "Error getting device ID: ${e.message}")
             "unknown_device"
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        handler?.removeCallbacksAndMessages(null)
+        try {
+            unregisterReceiver(connectivityReceiver)
+        } catch (_: Exception) {}
+        try {
+            locationManager.removeUpdates(this)
+        } catch (_: Exception) {}
+        android.util.Log.d("LocationService", "Service destroyed")
     }
 }
